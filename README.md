@@ -1,1 +1,2 @@
-大家运行test.py文件，这是编写的一个简单的示例，输入样本即为我们使用的振动信号，行为样本，列为每个样本的维度，最后一列为样本的标签。
+Main.py is the DIRLs code
+paraAnalysis.py is utilized to analyze the hyperparameters
