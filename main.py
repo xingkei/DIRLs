@@ -14,18 +14,18 @@ from scipy import io, signal
 
 
 def our_args():
-    parser = argparse.ArgumentParser(description='Domain invariant representation learning strategy')
-    parser.add_argument('--num_classes', type=int, default=4, help='padeborn:6;CEFL:4')
-    parser.add_argument('--batchSize', type=int, default=128, help='batch size')
+    parser = argparse.ArgumentParser(description='Working condition generalization')
+    parser.add_argument('--num_classes', type=int, default=6, help='padeborn:6;CEFL:4')
+    parser.add_argument('--batchSize', type=int, default=512, help='batch size')
     parser.add_argument('--shuffle', type=bool, default=True, help='shuffle')
     parser.add_argument('--normalization', type=bool, default=False, help='normalization')
-    parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
-    parser.add_argument('--epoches', type=int, default=30, help='epoch')
+    parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
+    parser.add_argument('--epoches', type=int, default=60, help='epoch')
     parser.add_argument('--bottleneck', type=int, default=256, help='bottleneck')
-    parser.add_argument('--alpha', type=float, default=1, help='蒸馏损失权重')
-    parser.add_argument('--beta', type=float, default=0.0004, help='类内距离损失权重')
+    parser.add_argument('--alpha', type=float, default=1, help='预测损失权重')
+    parser.add_argument('--beta', type=float, default=0.0004, help='距离损失权重')
     parser.add_argument('--lam', type=float, default=1, help='coral损失权重')
-    parser.add_argument('--distType', type=str, default='2-norm', help='距离计算方式')
+    parser.add_argument('--distType', type=str, default='2-norm', help='距离损失权重')
     args = parser.parse_args()
     return args
 
@@ -41,12 +41,18 @@ class Featurizer(nn.Module):
             nn.Conv1d(1, 32, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
+            # nn.BatchNorm1d(32),  # Batch normalization layer
+            # nn.Dropout(0.1),  # Dropout layer
             nn.Conv1d(32, 64, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
+            # nn.BatchNorm1d(64),
+            # nn.Dropout(0.1),
             nn.Conv1d(64, 128, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
+            # nn.BatchNorm1d(128),
+            nn.Dropout(0.1),
         )
 
     def forward(self, x):
@@ -81,7 +87,7 @@ class DIRLs(nn.Module):
         self.bottleneck = Bottleneck(args.bottleneck)  # 全连接层1
         self.classifier = Classifier(args.bottleneck, args.num_classes)  # 全连接层2，输出类别数为6
 
-        self.tfbd = args.bottleneck // 2  # //表示地板除法
+        self.tfbd = args.bottleneck//2   # //表示地板除法
 
         self.teaf = Featurizer()
         self.teab = Bottleneck(self.tfbd)
@@ -100,16 +106,13 @@ class DIRLs(nn.Module):
         for epoch in range(self.args.epoches):
             minibatches = [(tdata) for tdata in next(minibatches_iterator[epoch])]
             all_x = torch.cat([data[0].to(device).float() for data in minibatches])
-            b, a = signal.butter(N=2, Wn=[2300, 5300], btype='band', fs=12800)
-            x_filtered = signal.filtfilt(b, a, all_x.cpu().numpy())
-            hilbert_envelope = signal.hilbert(x_filtered)
-            hilbert_envelope = torch.abs(torch.tensor(hilbert_envelope))
-            all_z = torch.abs(torch.fft.fftn(hilbert_envelope)).to(device)  # 蒸馏过程注入包络谱知识
+            hilbert_envelope = signal.hilbert(all_x.cpu().numpy())
+            all_z = torch.abs(torch.fft.fftn(torch.tensor(hilbert_envelope))).to(device)      # 蒸馏过程注入包络谱知识
             # all_z = all_x
-            all_y = torch.cat([data[1].to(device).long() for data in minibatches])  # 标签
+            all_y = torch.cat([data[1].to(device).long() for data in minibatches])    # 标签
             optimizer.zero_grad()
-            all_p = self.teaNet(torch.unsqueeze(all_z.float(), dim=1))
-            loss = F.cross_entropy(all_p, torch.squeeze(all_y - 1), reduction='mean')
+            all_p = self.teaNet(torch.unsqueeze(all_z, dim=1))
+            loss = F.cross_entropy(all_p, torch.squeeze(all_y-1), reduction='mean')
             loss.backward()
             optimizer.step()
 
@@ -130,12 +133,7 @@ class DIRLs(nn.Module):
 
         return mean_diff + cova_diff
 
-    def mmd_linear(self, f_of_X, f_of_Y):
-        delta = f_of_X - f_of_Y
-        loss = torch.mean(torch.mm(delta, torch.transpose(delta, 0, 1)))
-        return loss
-
-    def update(self, minibatches, val_dataset, batchnum, epochs=30, lr=0.001):
+    def update(self, minibatches, val_dataset, batchnum, epochs, lr):
         opt1 = optim.Adam(self.featurizer.parameters(), lr=lr)
         opt2 = optim.Adam(self.bottleneck.parameters(), lr=lr)
         opt3 = optim.Adam(self.classifier.parameters(), lr=lr)
@@ -145,9 +143,9 @@ class DIRLs(nn.Module):
         self.train()
         # 复制epoch个迭代器
         batchdata = itertools.tee(minibatches, epochs)
-        for epoch in range(epochs):  # 迭代epoch
+        for epoch in range(epochs):    # 迭代epoch
             total_loss = 0.0
-            for batch in range(batchnum):  # 迭代batch
+            for batch in range(batchnum):    # 迭代batch
                 opt1.zero_grad()
                 opt2.zero_grad()
                 opt3.zero_grad()
@@ -155,58 +153,53 @@ class DIRLs(nn.Module):
                 all_x = torch.cat([data[0].cuda().float() for data in minibatch])
                 all_y = torch.cat([data[1].cuda().long() for data in minibatch])
                 with torch.no_grad():
-                    hilbert_envelope = signal.hilbert(all_x.cpu().numpy())
-                    all_x1 = torch.abs(torch.fft.fftn(torch.tensor(hilbert_envelope))).to(device)
+                    all_x1 = torch.angle(torch.fft.fftn(all_x))
                     tfea = self.teab(self.teaf(torch.unsqueeze(all_x1, dim=1))).detach()
 
                 all_z = self.bottleneck(self.featurizer(torch.unsqueeze(all_x, dim=1)))
-                loss1 = F.cross_entropy(self.classifier(all_z), torch.squeeze(all_y - 1))
+                loss1 = F.cross_entropy(self.classifier(all_z), torch.squeeze(all_y-1))
 
-                loss2 = F.mse_loss(all_z[:, :self.tfbd], tfea) * self.args.alpha
+                loss2 = F.mse_loss(all_z[:, :self.tfbd], tfea)*self.args.alpha
                 if self.args.distType == '2-norm':
                     loss3 = -F.mse_loss(all_z[:, :self.tfbd],
-                                        all_z[:, self.tfbd:]) * self.args.beta
+                                        all_z[:, self.tfbd:])*self.args.beta
                 elif self.args.distType == 'norm-2-norm':
-                    loss3 = -F.mse_loss(all_z[:, :self.tfbd] / torch.norm(all_z[:, :self.tfbd], dim=1, keepdim=True),
-                                        all_z[:, self.tfbd:] / torch.norm(all_z[:, self.tfbd:], dim=1,
-                                                                          keepdim=True)) * self.args.beta
+                    loss3 = -F.mse_loss(all_z[:, :self.tfbd]/torch.norm(all_z[:, :self.tfbd], dim=1, keepdim=True),
+                                        all_z[:, self.tfbd:]/torch.norm(all_z[:, self.tfbd:], dim=1, keepdim=True))*self.args.beta
                 elif self.args.distType == 'norm-1-norm':
-                    loss3 = -F.l1_loss(all_z[:, :self.tfbd] / torch.norm(all_z[:, :self.tfbd], dim=1, keepdim=True),
-                                       all_z[:, self.tfbd:] / torch.norm(all_z[:, self.tfbd:], dim=1,
-                                                                         keepdim=True)) * self.args.beta
+                    loss3 = -F.l1_loss(all_z[:, :self.tfbd]/torch.norm(all_z[:, :self.tfbd], dim=1, keepdim=True),
+                                       all_z[:, self.tfbd:]/torch.norm(all_z[:, self.tfbd:], dim=1, keepdim=True))*self.args.beta
                 elif self.args.distType == 'cos':
                     loss3 = torch.mean(F.cosine_similarity(
-                        all_z[:, :self.tfbd], all_z[:, self.tfbd:])) * self.args.beta
-
+                        all_z[:, :self.tfbd], all_z[:, self.tfbd:]))*self.args.beta
                 loss4 = 0
                 if len(minibatch) > 1:
-                    for i in range(len(minibatch) - 1):
-                        for j in range(i + 1, len(minibatch)):
-                            loss4 += self.coral(
-                                all_z[i * self.args.batchSize:(i + 1) * self.args.batchSize, self.tfbd:],
-                                all_z[j * self.args.batchSize:(j + 1) * self.args.batchSize, self.tfbd:])
-                    loss4 = loss4 * 2 / (len(minibatch) * (len(minibatch) - 1)) * self.args.lam
+                    for i in range(len(minibatch)-1):
+                        for j in range(i+1, len(minibatch)):
+                            loss4 += self.coral(all_z[i*self.args.batchSize:(i+1)*self.args.batchSize, self.tfbd:],
+                                                all_z[j*self.args.batchSize:(j+1)*self.args.batchSize, self.tfbd:])
+                    loss4 = loss4*2/(len(minibatch)*(len(minibatch)-1))*self.args.lam
                 else:
-                    loss4 = self.coral(all_z[:self.args.batchSize // 2, self.tfbd:],
-                                       all_z[self.args.batchSize // 2:, self.tfbd:])
-                    loss4 = loss4 * self.args.lam
+                    loss4 = self.coral(all_z[:self.args.batchSize//2, self.tfbd:],
+                                       all_z[self.args.batchSize//2:, self.tfbd:])
+                    loss4 = loss4*self.args.lam
 
-                loss = loss1 + loss2 + loss3 + loss4  # loss1分类误差  loss2 蒸馏损失  loss3 类内损失  loss4  跨域损失
+                loss = loss1+loss2+loss3+loss4    # loss1分类误差  loss2 蒸馏损失  loss3 类内损失  loss4  跨域损失
                 loss.backward()
                 opt1.step()
                 opt2.step()
                 opt3.step()
                 total_loss += loss.item()
             self.eval()
-            val_acc = self.validation(val_dataset)
+            val_acc = self.validation(val_dataset, args)
             self.train()
             print({'epoch': f'{epoch:.0f}', 'class': f'{loss1.item():.4f}', 'dist': f'{loss2.item():.4f}',
-                   'inner': f'{loss3.item():.4f}', 'align': f'{loss4.item():.4f}', 'total': f'{total_loss:.4f}',
+                   'exp': f'{loss3.item():.4f}', 'align': f'{loss4.item():.4f}', 'total': f'{total_loss:.4f}',
                    'val_acc': f'{val_acc:.4f}'})
             acc_list.append(val_acc.item())
             loss_list.append(total_loss)
         self.eval()
-        plot_fig(range(1, epochs + 1), loss_list, acc_list)
+        plot_fig(range(1, epochs+1), loss_list, acc_list)
         # 将list转换为numpy数组
         my_array1 = np.array(loss_list)
         my_array2 = np.array(acc_list)
@@ -216,14 +209,14 @@ class DIRLs(nn.Module):
 
     def predict(self, x):
         self.to(device)
-        return self.classifier(self.bottleneck(self.featurizer(x)))
+        return self.classifier(self.bottleneck(self.featurizer(x))), self.bottleneck(self.featurizer(x))
 
-    def validation(self, val_data):
-        metric = torchmetrics.Accuracy(task='multiclass', num_classes=6).to(device)
+    def validation(self, val_data, args):
+        metric = torchmetrics.Accuracy(task='multiclass', num_classes=args.num_classes).to(device)
         with torch.no_grad():
             for inputs, labels in val_data:
                 inputs, labels = inputs.to(device), labels.to(device)  # 将数据移动到 GPU 上
-                outputs = self.predict(torch.unsqueeze(inputs, dim=1))
+                outputs, _ = self.predict(torch.unsqueeze(inputs, dim=1))
                 _, predicted = torch.max(outputs, 1)
                 batch_acc = metric(predicted, (labels - 1).squeeze())
         total_acc = metric.compute()
@@ -231,36 +224,36 @@ class DIRLs(nn.Module):
 
 
 # 针对paderborn数据集
-class ConvNet(nn.Module):
-    def __init__(self):
-        super(ConvNet, self).__init__()
-        self.feature = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(32, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(64, 128, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-        )
-
-        # 计算全连接层输入特征数量，需要根据卷积层的输出维度和输入样本的特征维度计算
-        self.bottleneck = nn.Linear(128 * 318, 256)  # 全连接层1
-        self.classifier = nn.Linear(256, args.num_classes)  # 全连接层2，输出类别数为6
-
-    def forward(self, x):
-        x = x.unsqueeze(1)  # 将输入张量增加一个维度以适应卷积层的输入要求
-        # 输入x的维度应该为 (batch_size, 1, 2560)
-        x = self.feature(x)
-
-        # 将卷积层的输出展平
-        x = x.view(x.size(0), -1)
-
-        x = F.relu(self.bottleneck(x))
-        x = self.classifier(x)
-        return x
+# class ConvNet(nn.Module):
+#     def __init__(self):
+#         super(ConvNet, self).__init__()
+#         self.feature = nn.Sequential(
+#             nn.Conv1d(1, 32, kernel_size=3, stride=1),
+#             nn.ReLU(),
+#             nn.MaxPool1d(kernel_size=2),
+#             nn.Conv1d(32, 64, kernel_size=3, stride=1),
+#             nn.ReLU(),
+#             nn.MaxPool1d(kernel_size=2),
+#             nn.Conv1d(64, 128, kernel_size=3, stride=1),
+#             nn.ReLU(),
+#             nn.MaxPool1d(kernel_size=2),
+#         )
+#
+#         # 计算全连接层输入特征数量，需要根据卷积层的输出维度和输入样本的特征维度计算
+#         self.bottleneck = nn.Linear(128 * 318, 256)  # 全连接层1
+#         self.classifier = nn.Linear(256, 6)  # 全连接层2，输出类别数为6
+#
+#     def forward(self, x):
+#         x = x.unsqueeze(1)  # 将输入张量增加一个维度以适应卷积层的输入要求
+#         # 输入x的维度应该为 (batch_size, 1, 2560)
+#         x = self.feature(x)
+#
+#         # 将卷积层的输出展平
+#         x = x.view(x.size(0), -1)
+#
+#         x = F.relu(self.bottleneck(x))
+#         x = self.classifier(x)
+#         return x
 
 
 # 创建数据集和数据加载器
@@ -299,8 +292,8 @@ def train_model(model, minibatches, batchnum, epochs=30, lr=0.001):
 
 
 # 测试模型
-def test_model(model, dataloader):
-    metric = torchmetrics.Accuracy(task='multiclass', num_classes=6).to(device)
+def test_model(model, dataloader, args):
+    metric = torchmetrics.Accuracy(task='multiclass', num_classes=args.num_classes).to(device)
     model.eval()
     with torch.no_grad():
         for inputs, labels in dataloader:
@@ -322,21 +315,22 @@ class TestDIRLs:
         with torch.no_grad():
             for inputs, labels in self.data:
                 inputs, labels = inputs.to(device), labels.to(device)  # 将数据移动到 GPU 上
-                outputs = self.model.predict(torch.unsqueeze(inputs, dim=1))
+                outputs, representations = self.model.predict(torch.unsqueeze(inputs, dim=1))
                 _, predicted = torch.max(outputs, 1)
                 batch_acc = metric(predicted, (labels - 1).squeeze())
         total_acc = metric.compute()
         print("Accuracy: %.3f %% of the DIFEX" % (total_acc * 100))
-        # hunxiao(predicted, (labels - 1).squeeze(), 6)
+        # hunxiao(predicted, (labels - 1).squeeze(), args.num_classes)
         # 将list转换为numpy数组
-        my_array3 = np.array((predicted + 1).cpu().tolist())
+        my_array3 = np.array((predicted+1).cpu().tolist())
         my_array4 = np.array(labels.squeeze().cpu().tolist())
-        # 使用scipy的savemat函数保存为.mat文件  预测标签信息用于计算混淆矩阵
-        io.savemat('./output/con_pad.mat', {'y_pred': my_array3, 'y_true': my_array4})
+        my_array5 = np.array(representations.cpu().tolist())
+        # 使用scipy的savemat函数保存为.mat文件
+        io.savemat('./output/con_pad.mat', {'y_pred': my_array3, 'y_true': my_array4, 'rep': my_array5})
 
         # 绘制ROCs
-        ROCs(outputs.cpu().numpy(), nn.functional.one_hot((labels - 1).squeeze().cpu(), args.num_classes),
-             args.num_classes)
+        # ROCs(outputs.cpu().numpy(), nn.functional.one_hot((labels-1).squeeze().cpu(), num_classes=args.num_classes),
+        #      num_class=args.num_classes)
 
 
 def set_random_seed(seed=0):
@@ -355,20 +349,21 @@ if __name__ == "__main__":
     # 导入参数
     args = our_args()
     # 创建数据加载器
-    dataset1 = create_dataset('.\Labbearing/condition3.mat', Normalize=args.normalization)
+    dataset1 = create_dataset('.\paderborn/condition1.mat', Normalize=args.normalization)
     trainloader1 = DataLoader(dataset1, batch_size=args.batchSize, shuffle=args.shuffle, drop_last=True)
-    dataset2 = create_dataset('.\Labbearing/condition4.mat', Normalize=args.normalization)
+    dataset2 = create_dataset('.\paderborn/condition2.mat', Normalize=args.normalization)
     trainloader2 = DataLoader(dataset2, batch_size=args.batchSize, shuffle=args.shuffle, drop_last=True)
-    dataset3 = create_dataset('.\Labbearing/condition1.mat', Normalize=args.normalization)
+    dataset3 = create_dataset('.\paderborn/condition3.mat', Normalize=args.normalization)
     trainloader3 = DataLoader(dataset3, batch_size=args.batchSize, shuffle=args.shuffle, drop_last=True)
-    dataset4 = create_dataset('.\Labbearing/condition2.mat', Normalize=args.normalization)
+    dataset4 = create_dataset('.\paderborn/condition4.mat', Normalize=args.normalization)
 
     trainset = torch.utils.data.ConcatDataset([dataset1, dataset2, dataset3])
-    trainlaoder = DataLoader(trainset, batch_size=args.batchSize, shuffle=False, drop_last=True)
+    trainlaoder = DataLoader(trainset, batch_size=args.batchSize, shuffle=args.shuffle, drop_last=True)
 
-    testloader = DataLoader(dataset4, batch_size=2000, shuffle=True, drop_last=True)
+    testloader = DataLoader(dataset4, batch_size=3000, shuffle=True, drop_last=True)
+    sourceloader = DataLoader(dataset1, batch_size=3000, shuffle=True, drop_last=True)
     # 初始化模型
-    model = ConvNet()
+    # model = ConvNet()
     model1 = DIRLs(args)
     # 融合多个dataset
     batchnum = len(trainloader1)
@@ -381,10 +376,10 @@ if __name__ == "__main__":
     # # 训练原始模型
     # train_model(model, minibatch[2], batchnum=batchnum)
     # # 测试原始模型
-    # test_model(model, testloader)
+    # test_model(model, testloader, args)
 
     # 训练DIRLs模型
-    model1.update(minibatches=minibatch[1], val_dataset=testloader, epochs=args.epoches, batchnum=batchnum)
+    model1.update(minibatches=minibatch[1], val_dataset=testloader, epochs=args.epoches, batchnum=batchnum, lr=args.lr)
     # 测试DIRLs
     AccDIRLs = TestDIRLs(model1, testloader)
     AccDIRLs.acc(args)
