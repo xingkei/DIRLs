@@ -345,7 +345,7 @@ def set_random_seed(seed=0):
 
 if __name__ == "__main__":
     # 固定随机种子
-    set_random_seed()
+    set_random_seed(100)
     # 导入参数
     args = our_args()
     # 创建数据加载器
